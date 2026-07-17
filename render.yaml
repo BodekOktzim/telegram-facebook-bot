@@ -3,7 +3,7 @@ services:
     name: telegram-facebook-bot
     env: node
     plan: free
-    buildCommand: npm install
+    buildCommand: npm install --ignore-scripts
     startCommand: npm start
     envVars:
       - key: BOT_TOKEN

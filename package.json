@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node bot-pro.js",
-    "dev": "node --watch bot-pro.js"
+    "dev": "node --watch bot-pro.js",
+    "build": "npm install --ignore-scripts"
   },
   "dependencies": {
     "telegraf": "^4.14.0",
