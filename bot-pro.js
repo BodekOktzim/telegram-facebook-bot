@@ -1,5 +1,4 @@
 import { Telegraf, Markup } from 'telegraf';
-import mediaGroup from 'telegraf-media-group';
 import Database from 'better-sqlite3';
 import express from 'express';
 import dotenv from 'dotenv';
@@ -22,7 +21,6 @@ const bot = new Telegraf(BOT_TOKEN);
 
 // Middleware
 app.use(express.json());
-bot.use(mediaGroup());
 
 // Database initialization
 let db = null;
@@ -278,8 +276,8 @@ bot.hears('🔙 חזור', (ctx) => {
   ctx.reply('🔙 חזרנו', keyboard);
 });
 
-// Multi-file upload handler
-bot.on(['document', 'media_group'], async (ctx) => {
+// Document upload handler
+bot.on('document', async (ctx) => {
   if (!isAdmin(ctx.from.id)) {
     ctx.reply('❌ רק Admin');
     return;
@@ -288,58 +286,51 @@ bot.on(['document', 'media_group'], async (ctx) => {
   try {
     ctx.sendChatAction('upload_document');
 
-    const messagesToProcess = ctx.mediaGroup || [ctx.message];
-    let uploadedCount = 0;
+    const file = ctx.message.document;
+    const fileName = file.file_name;
+    const fileExt = path.extname(fileName).toLowerCase();
 
-    for (const msg of messagesToProcess) {
-      const file = msg.document;
-      if (!file) continue; // Skip if not a document
+    // Download file
+    const fileLink = await ctx.telegram.getFileLink(file.file_id);
+    const response = await fetch(fileLink.href);
+    const buffer = await response.arrayBuffer();
+    const bufferObj = Buffer.from(buffer);
 
-      const fileName = file.file_name;
-      const fileExt = path.extname(fileName).toLowerCase();
+    // Calculate hash
+    const fileHash = calculateFileHash(bufferObj);
 
-      // Download file
-      const fileLink = await ctx.telegram.getFileLink(file.file_id);
-      const response = await fetch(fileLink.href);
-      const buffer = await response.arrayBuffer();
-      const bufferObj = Buffer.from(buffer);
-
-      // Calculate hash
-      const fileHash = calculateFileHash(bufferObj);
-
-      // Check for duplicates
-      if (config.fileHashes[fileHash]) {
-        ctx.reply(`⚠️ קובץ כפול: ${fileName}\n\n❌ הקובץ כבר קיים במאגר (${config.fileHashes[fileHash]})`);
-        continue;
-      }
-
-      // Save file
-      const uniqueName = `${Date.now()}_${fileName}`;
-      const filePath = path.join(uploadsDir, uniqueName);
-      fs.writeFileSync(filePath, bufferObj);
-
-      // Add to config
-      config.uploadedFiles = config.uploadedFiles || [];
-      config.uploadedFiles.push({
-        name: fileName,
-        path: uniqueName,
-        type: fileExt.substring(1).toUpperCase() || 'FILE',
-        date: new Date().toISOString().split('T')[0],
-        size: formatFileSize(bufferObj.byteLength),
-        hash: fileHash
-      });
-
-      // Store hash
-      config.fileHashes[fileHash] = fileName;
-      saveConfig();
-      uploadedCount++;
+    // Check for duplicates
+    if (config.fileHashes[fileHash]) {
+      ctx.reply(`⚠️ קובץ כפול: ${fileName}\n\n❌ הקובץ כבר קיים במאגר (${config.fileHashes[fileHash]})`);
+      return;
     }
 
-    if (uploadedCount > 0) {
-      ctx.reply(`✅ ${uploadedCount} קבצים הועלו בהצלחה!`);
-    } else {
-      ctx.reply('⚠️ לא הועלו קבצים חדשים.');
-    }
+    // Save file
+    const uniqueName = `${Date.now()}_${fileName}`;
+    const filePath = path.join(uploadsDir, uniqueName);
+    fs.writeFileSync(filePath, bufferObj);
+
+    // Add to config
+    config.uploadedFiles = config.uploadedFiles || [];
+    config.uploadedFiles.push({
+      name: fileName,
+      path: uniqueName,
+      type: fileExt.substring(1).toUpperCase() || 'FILE',
+      date: new Date().toISOString().split('T')[0],
+      size: formatFileSize(bufferObj.byteLength),
+      hash: fileHash
+    });
+
+    // Store hash
+    config.fileHashes[fileHash] = fileName;
+    saveConfig();
+
+    ctx.reply(
+      `✅ קובץ ${fileName} הועלה בהצלחה!\n\n` +
+      `📊 סוג: ${fileExt || 'לא ידוע'}\n` +
+      `💾 גודל: ${formatFileSize(bufferObj.byteLength)}\n` +
+      `🔐 Hash: ${fileHash.substring(0, 8)}...`
+    );
 
   } catch (error) {
     console.error('Upload error:', error);
@@ -358,7 +349,7 @@ bot.on('text', (ctx) => {
     let searchType = 'phone';
     let searchQuery = text;
 
-    if (text.includes("facebook.com")) {
+    if (text.includes('facebook.com')) {
       let match;
       // Try to match various Facebook profile URL formats
       // e.g., facebook.com/username, facebook.com/profile.php?id=123, facebook.com/groups/..., facebook.com/pages/...
