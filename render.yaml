@@ -3,8 +3,9 @@ services:
     name: telegram-facebook-bot
     env: node
     plan: free
-    buildCommand: npm install --ignore-scripts
+    buildCommand: npm install
     startCommand: npm start
+    nodeVersion: 20.18.0
     envVars:
       - key: BOT_TOKEN
         value: 8810032339:AAEd_QXFwxWKcAFFZGPryfcuGiFMJOoSCNg
