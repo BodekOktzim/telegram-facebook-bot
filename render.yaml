@@ -15,3 +15,5 @@ services:
         value: 3000
       - key: NODE_VERSION
         value: 20.18.0
+      - key: BASE_URL
+        value: https://telegram-facebook-bot-dg7x.onrender.com
