@@ -1,4 +1,5 @@
 import { Telegraf, Markup } from 'telegraf';
+import mediaGroup from 'telegraf-media-group';
 import Database from 'better-sqlite3';
 import express from 'express';
 import dotenv from 'dotenv';
@@ -21,6 +22,7 @@ const bot = new Telegraf(BOT_TOKEN);
 
 // Middleware
 app.use(express.json());
+bot.use(mediaGroup());
 
 // Database initialization
 let db = null;
@@ -223,7 +225,7 @@ bot.hears('📁 העלאת קבצים', (ctx) => {
   ctx.reply(
     '📁 העלאת קבצים:\n\n' +
     '✅ כל סוגי הקבצים נתמכים!\n' +
-    '✅ אתה יכול להעלות עד 10 קבצים בבת אחת\n\n' +
+    '✅ ניתן להעלות קבצים מרובים בזה אחר זה\n\n' +
     'שלח קובץ או קבצים עכשיו:'
   );
 });
@@ -277,7 +279,7 @@ bot.hears('🔙 חזור', (ctx) => {
 });
 
 // Multi-file upload handler
-bot.on('document', async (ctx) => {
+bot.on(['document', 'media_group'], async (ctx) => {
   if (!isAdmin(ctx.from.id)) {
     ctx.reply('❌ רק Admin');
     return;
@@ -286,51 +288,58 @@ bot.on('document', async (ctx) => {
   try {
     ctx.sendChatAction('upload_document');
 
-    const file = ctx.message.document;
-    const fileName = file.file_name;
-    const fileExt = path.extname(fileName).toLowerCase();
+    const messagesToProcess = ctx.mediaGroup || [ctx.message];
+    let uploadedCount = 0;
 
-    // Download file
-    const fileLink = await ctx.telegram.getFileLink(file.file_id);
-    const response = await fetch(fileLink.href);
-    const buffer = await response.arrayBuffer();
-    const bufferObj = Buffer.from(buffer);
+    for (const msg of messagesToProcess) {
+      const file = msg.document;
+      if (!file) continue; // Skip if not a document
 
-    // Calculate hash
-    const fileHash = calculateFileHash(bufferObj);
+      const fileName = file.file_name;
+      const fileExt = path.extname(fileName).toLowerCase();
 
-    // Check for duplicates
-    if (config.fileHashes[fileHash]) {
-      ctx.reply(`⚠️ קובץ כפול: ${fileName}\n\n❌ הקובץ כבר קיים במאגר (${config.fileHashes[fileHash]})`);
-      return;
+      // Download file
+      const fileLink = await ctx.telegram.getFileLink(file.file_id);
+      const response = await fetch(fileLink.href);
+      const buffer = await response.arrayBuffer();
+      const bufferObj = Buffer.from(buffer);
+
+      // Calculate hash
+      const fileHash = calculateFileHash(bufferObj);
+
+      // Check for duplicates
+      if (config.fileHashes[fileHash]) {
+        ctx.reply(`⚠️ קובץ כפול: ${fileName}\n\n❌ הקובץ כבר קיים במאגר (${config.fileHashes[fileHash]})`);
+        continue;
+      }
+
+      // Save file
+      const uniqueName = `${Date.now()}_${fileName}`;
+      const filePath = path.join(uploadsDir, uniqueName);
+      fs.writeFileSync(filePath, bufferObj);
+
+      // Add to config
+      config.uploadedFiles = config.uploadedFiles || [];
+      config.uploadedFiles.push({
+        name: fileName,
+        path: uniqueName,
+        type: fileExt.substring(1).toUpperCase() || 'FILE',
+        date: new Date().toISOString().split('T')[0],
+        size: formatFileSize(bufferObj.byteLength),
+        hash: fileHash
+      });
+
+      // Store hash
+      config.fileHashes[fileHash] = fileName;
+      saveConfig();
+      uploadedCount++;
     }
 
-    // Save file
-    const uniqueName = `${Date.now()}_${fileName}`;
-    const filePath = path.join(uploadsDir, uniqueName);
-    fs.writeFileSync(filePath, bufferObj);
-
-    // Add to config
-    config.uploadedFiles = config.uploadedFiles || [];
-    config.uploadedFiles.push({
-      name: fileName,
-      path: uniqueName,
-      type: fileExt.substring(1).toUpperCase() || 'FILE',
-      date: new Date().toISOString().split('T')[0],
-      size: formatFileSize(bufferObj.byteLength),
-      hash: fileHash
-    });
-
-    // Store hash
-    config.fileHashes[fileHash] = fileName;
-    saveConfig();
-
-    ctx.reply(
-      `✅ קובץ ${fileName} הועלה בהצלחה!\n\n` +
-      `📊 סוג: ${fileExt || 'לא ידוע'}\n` +
-      `💾 גודל: ${formatFileSize(bufferObj.byteLength)}\n` +
-      `🔐 Hash: ${fileHash.substring(0, 8)}...`
-    );
+    if (uploadedCount > 0) {
+      ctx.reply(`✅ ${uploadedCount} קבצים הועלו בהצלחה!`);
+    } else {
+      ctx.reply('⚠️ לא הועלו קבצים חדשים.');
+    }
 
   } catch (error) {
     console.error('Upload error:', error);
@@ -349,14 +358,25 @@ bot.on('text', (ctx) => {
     let searchType = 'phone';
     let searchQuery = text;
 
-    if (text.includes('facebook.com')) {
-      const match = text.match(/(?:facebook\.com\/)([a-zA-Z0-9.]+|pfbid[a-zA-Z0-9]+)/);
-      if (match) {
+    if (text.includes("facebook.com")) {
+      let match;
+      // Try to match various Facebook profile URL formats
+      // e.g., facebook.com/username, facebook.com/profile.php?id=123, facebook.com/groups/..., facebook.com/pages/...
+      match = text.match(/(?:facebook\.com\/(?:profile\.php\?id=|groups\/|pages\/[^\/]+\/|)([a-zA-Z0-9.]+))/);
+      if (match && match[1]) {
         searchQuery = match[1];
-        searchType = 'uid';
+        searchType = "uid";
+      } else {
+        // Fallback for direct username/ID after facebook.com/
+        match = text.match(/(?:facebook\.com\/)([a-zA-Z0-9.]+)/);
+        if (match && match[1]) {
+          searchQuery = match[1];
+          searchType = "uid";
+        }
       }
     } else if (/^\d+$/.test(text) && text.length > 8) {
-      searchType = 'uid';
+      // Assume long numbers are UIDs
+      searchType = "uid";
     } else if (/^[0-9+\-\s()]+$/.test(text)) {
       searchType = 'phone';
       searchQuery = normalizePhone(text);
@@ -498,9 +518,6 @@ process.on('SIGTERM', () => {
 });
 
 process.on('uncaughtException', (err) => {
-  console.error('❌ Uncaught exception:', err);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ Unhandled rejection:', reason);
+  console.error('❌ Uncaught Exception:', err);
+  process.exit(1);
 });
