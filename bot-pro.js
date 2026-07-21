@@ -51,6 +51,10 @@ function saveConfig() {
 
 loadConfig();
 
+function isAdmin(userId) {
+  return config.adminUsers?.includes(userId) || userId === ADMIN_ID;
+}
+
 // --- Hebrew Translation Mapping ---
 const countryTranslation = {
   'israel': 'ישראל',
