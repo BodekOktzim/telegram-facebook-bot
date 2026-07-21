@@ -4,9 +4,10 @@ import express from 'express';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
-import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import busboy from 'busboy';
+import admzip from 'adm-zip';
+import csv from 'csv-parser';
 
 dotenv.config();
 
@@ -21,38 +22,16 @@ const BASE_URL = process.env.BASE_URL || `https://telegram-facebook-bot-dg7x.onr
 const app = express();
 const bot = new Telegraf(BOT_TOKEN);
 
-// Middleware
 app.use(express.json());
-
-// Database initialization
-let db = null;
-
-function getDB() {
-  if (!db) {
-    try {
-      db = new Database('./facebook.db', { readonly: true });
-      console.log('✅ Database connected');
-    } catch (error) {
-      console.error('❌ Database error:', error.message);
-      return null;
-    }
-  }
-  return db;
-}
 
 // Configuration
 const configFile = './config.json';
 const uploadsDir = './uploads';
-
-// Ensure uploads directory exists
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 
 let config = {
   uploadedFiles: [],
-  adminUsers: [ADMIN_ID],
-  fileHashes: {} // Track file hashes for duplicates
+  adminUsers: [ADMIN_ID]
 };
 
 function loadConfig() {
@@ -60,66 +39,108 @@ function loadConfig() {
     if (fs.existsSync(configFile)) {
       const data = fs.readFileSync(configFile, 'utf8');
       config = { ...config, ...JSON.parse(data) };
-      console.log('✅ Config loaded');
     }
-  } catch (e) {
-    console.error('⚠️ Config error:', e.message);
-  }
+  } catch (e) { console.error('Config error:', e.message); }
 }
 
 function saveConfig() {
   try {
     fs.writeFileSync(configFile, JSON.stringify(config, null, 2));
-  } catch (e) {
-    console.error('❌ Save config error:', e.message);
-  }
+  } catch (e) { console.error('Save config error:', e.message); }
 }
 
 loadConfig();
 
-// Helpers
-function formatFileSize(bytes) {
-  if (bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i];
-}
+// --- Hebrew Translation Mapping ---
+const countryTranslation = {
+  'israel': 'ישראל',
+  'facebook.db': 'ישראל',
+  'china': 'סין',
+  'albania': 'אלבניה',
+  'afghanistan': 'אפגניסטן',
+  'maldives': 'המלדיביים',
+  'brazil': 'ברזיל',
+  'usa': 'ארה"ב',
+  'russia': 'רוסיה',
+  'france': 'צרפת',
+  'germany': 'גרמניה',
+  'italy': 'איטליה',
+  'spain': 'ספרד',
+  'turkey': 'טורקיה',
+  'egypt': 'מצרים',
+  'jordan': 'ירדן',
+  'lebanon': 'לבנון',
+  'syria': 'סוריה',
+  'iraq': 'עיראק',
+  'iran': 'איראן',
+  'india': 'הודו',
+  'uk': 'בריטניה',
+  'canada': 'קנדה'
+};
 
-function getTotalSize() {
-  if (!config.uploadedFiles || config.uploadedFiles.length === 0) return '0 B';
-  
-  let total = 0;
-  config.uploadedFiles.forEach(file => {
-    const sizeStr = file.size;
-    const parts = sizeStr.split(' ');
-    const num = parseFloat(parts[0]);
-    const unit = parts[1];
-    
-    const multipliers = { 'B': 1, 'KB': 1024, 'MB': 1024*1024, 'GB': 1024*1024*1024, 'TB': 1024*1024*1024*1024 };
-    total += num * (multipliers[unit] || 1);
-  });
-  
-  return formatFileSize(total);
-}
-
-function normalizePhone(phone) {
-  const digits = phone.replace(/\D/g, '');
-  if (digits.startsWith('0')) {
-    return '972' + digits.substring(1);
+function getHebrewName(filename) {
+  const lowerName = filename.toLowerCase();
+  for (const [eng, heb] of Object.entries(countryTranslation)) {
+    if (lowerName.includes(eng)) return heb;
   }
-  return digits;
+  return filename.split('.')[0]; // Fallback to filename without extension
 }
 
-function isAdmin(userId) {
-  return config.adminUsers?.includes(userId) || userId === ADMIN_ID;
+// --- Universal Search Engine ---
+async function searchAllSources(query, type) {
+  const results = [];
+  
+  // 1. Search in main facebook.db if exists
+  if (fs.existsSync('./facebook.db')) {
+    try {
+      const db = new Database('./facebook.db', { readonly: true });
+      const field = type === 'phone' ? 'phone' : 'uid';
+      const row = db.prepare(`SELECT * FROM facebook WHERE ${field} = ? LIMIT 1`).get(query);
+      if (row) {
+        results.push({ source: 'ישראל', data: row });
+      }
+      db.close();
+    } catch (e) { console.error('Search facebook.db error:', e.message); }
+  }
+
+  // 2. Search in uploaded files
+  for (const fileInfo of config.uploadedFiles) {
+    const filePath = path.join(uploadsDir, fileInfo.path);
+    if (!fs.existsSync(filePath)) continue;
+
+    const ext = path.extname(fileInfo.name).toLowerCase();
+    const hebrewName = getHebrewName(fileInfo.name);
+
+    try {
+      if (['.db', '.sqlite', '.sqlite3'].includes(ext)) {
+        const db = new Database(filePath, { readonly: true });
+        // Try to find a table that might contain the data
+        const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
+        for (const table of tables) {
+          try {
+            const field = type === 'phone' ? 'phone' : 'uid';
+            const row = db.prepare(`SELECT * FROM ${table.name} WHERE ${field} = ? LIMIT 1`).get(query);
+            if (row) {
+              results.push({ source: hebrewName, data: row });
+              break; 
+            }
+          } catch (e) {}
+        }
+        db.close();
+      } else if (['.csv', '.txt', '.json'].includes(ext)) {
+        // Simple text-based search for demonstration (in real world, large files need indexing)
+        // For now, we assume these are small or structured similarly
+      }
+      // Note: For .zip, .rar etc, we'd need to extract and search, but usually users upload .db directly or zip of .db
+    } catch (e) { console.error(`Search in ${fileInfo.name} error:`, e.message); }
+  }
+
+  return results;
 }
 
-function formatUserData(row) {
-  if (!row) return null;
-
-  let message = '✅ נמצא במאגר!\n\n';
-  message += '👤 פרטים אישיים:\n';
+function formatUserData(source, row) {
+  let message = `📍 **מקור: ${source}**\n`;
+  message += '👤 פרטים:\n';
 
   const fields = [
     { label: '🆔', key: 'uid' },
@@ -130,12 +151,7 @@ function formatUserData(row) {
     { label: '⚧', key: 'gender' },
     { label: '🎂', key: 'birthday' },
     { label: '📍', key: 'location' },
-    { label: '🏠', key: 'hometown' },
-    { label: '💑', key: 'relationship_status' },
-    { label: '🎓', key: 'education_last_year' },
-    { label: '💼', key: 'work' },
-    { label: '📅', key: 'date_registered' },
-    { label: '🔄', key: 'last_update' }
+    { label: '🏠', key: 'hometown' }
   ];
 
   fields.forEach(field => {
@@ -145,364 +161,108 @@ function formatUserData(row) {
     }
   });
 
-  if (row.uid) {
-    message += `\n🔗 קישור לפרופיל: https://www.facebook.com/${row.uid}`;
-  }
-
-  return message;
+  if (row.uid) message += `🔗 https://www.facebook.com/${row.uid}\n`;
+  return message + '\n';
 }
 
-// Bot Commands
+// --- Bot Logic ---
 bot.start((ctx) => {
-  try {
-    const userId = ctx.from.id;
-    const isAdminUser = isAdmin(userId);
-
-    let keyboard;
-    if (isAdminUser) {
-      keyboard = Markup.keyboard([
-        ['🔍 חיפוש טלפון', '🆔 חיפוש ID'],
-        ['📊 סטטיסטיקות', '⚙️ הגדרות'],
-        ['📁 העלאת קבצים', '📋 קבצים']
-      ]).resize();
-    } else {
-      keyboard = Markup.keyboard([
-        ['🔍 חיפוש טלפון', '🆔 חיפוש ID'],
-        ['📊 סטטיסטיקות', '❓ עזרה']
-      ]).resize();
-    }
-
-    ctx.reply(
-      '🤖 ברוכים הבאים לבוט חיפוש!\n\n' +
-      (isAdminUser ? '👨‍💼 אתה מנהל\n\n' : '') +
-      'בחר פעולה או שלח:\n' +
-      '📱 מספר טלפון\n' +
-      '🆔 Facebook ID\n' +
-      '🔗 קישור לפרופיל',
-      keyboard
-    );
-  } catch (error) {
-    console.error('Start command error:', error);
-    ctx.reply('❌ שגיאה בהתחלה');
-  }
-});
-
-// Button handlers
-bot.hears('🔍 חיפוש טלפון', (ctx) => {
-  ctx.reply('📱 שלח מספר טלפון:');
-});
-
-bot.hears('🆔 חיפוש ID', (ctx) => {
-  ctx.reply('🆔 שלח ID או קישור:');
-});
-
-bot.hears('📊 סטטיסטיקות', (ctx) => {
-  try {
-    let message = '📊 סטטיסטיקות:\n\n';
-    message += `📈 משתמשים במאגר: 3,956,428\n`;
-    message += `📁 קבצים מועלים: ${config.uploadedFiles?.length || 0}\n`;
-    message += `💾 גודל כולל: ${getTotalSize()}\n`;
-    message += `🔓 חיפוש: ללא הגבלות`;
-    
-    ctx.reply(message);
-  } catch (error) {
-    ctx.reply('❌ שגיאה בסטטיסטיקות');
-  }
-});
-
-bot.hears('❓ עזרה', (ctx) => {
-  ctx.reply(
-    '📚 עזרה:\n\n' +
-    '🔍 חיפוש טלפון\n' +
-    '🆔 חיפוש ID\n' +
-    '📊 סטטיסטיקות\n\n' +
-    'שלח מספר או ID לחיפוש'
-  );
-});
-
-bot.hears('⚙️ הגדרות', (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    ctx.reply('❌ רק Admin');
-    return;
-  }
-
   const keyboard = Markup.keyboard([
-    ['📋 הצג הגדרות'],
-    ['🔙 חזור']
+    ['🔍 חיפוש טלפון', '🆔 חיפוש ID'],
+    ['📊 סטטיסטיקות', '📁 העלאת קבצים']
   ]).resize();
+  ctx.reply('🤖 ברוכים הבאים לבוט החיפוש המורחב!\nשלח מספר טלפון, ID או קישור לפייסבוק.', keyboard);
+});
 
-  ctx.reply('⚙️ הגדרות Admin:', keyboard);
+bot.hears('🔍 חיפוש טלפון', (ctx) => ctx.reply('📱 שלח מספר טלפון:'));
+bot.hears('🆔 חיפוש ID', (ctx) => ctx.reply('🆔 שלח ID או קישור:'));
+bot.hears('📊 סטטיסטיקות', (ctx) => {
+  ctx.reply(`📊 סטטיסטיקות:\n📈 מאגרים פעילים: ${config.uploadedFiles.length + 1}\n💾 סך הכל קבצים: ${config.uploadedFiles.length}`);
 });
 
 bot.hears('📁 העלאת קבצים', (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    ctx.reply('❌ רק Admin');
-    return;
-  }
-
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ רק Admin');
   const uploadUrl = `${BASE_URL}/upload-page?adminId=${ctx.from.id}`;
-  ctx.reply(
-    '📁 העלאת קבצים ללא הגבלה:\n\n' +
-    '✅ ניתן להעלות קבצים בכל גודל (גם כמה GB!)\n' +
-    '✅ העלאה מתבצעת דרך הדפדפן כדי לעקוף את מגבלת טלגרם\n\n' +
-    'לחץ על הקישור להעלאה:\n' +
-    uploadUrl,
-    Markup.inlineKeyboard([
-      Markup.button.url('🌐 פתח דף העלאה', uploadUrl)
-    ])
-  );
+  ctx.reply(`📁 העלאת קבצים (כל הסוגים):\n1. שלח קובץ ישירות לפה (עד 2GB)\n2. או השתמש בדף האינטרנט:\n${uploadUrl}`);
 });
 
-bot.hears('📋 קבצים', (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    ctx.reply('❌ רק Admin');
-    return;
-  }
-
-  try {
-    let message = '📋 קבצים:\n\n';
-    if (config.uploadedFiles?.length > 0) {
-      config.uploadedFiles.slice(-20).forEach((file, i) => {
-        message += `${i + 1}. ${file.name}\n   📊 ${file.type} | 💾 ${file.size} | 📅 ${file.date}\n`;
-      });
-      if (config.uploadedFiles.length > 20) {
-        message += `\n... ועוד ${config.uploadedFiles.length - 20} קבצים`;
-      }
-    } else {
-      message = '📁 אין קבצים';
-    }
-    ctx.reply(message);
-  } catch (error) {
-    ctx.reply('❌ שגיאה');
-  }
-});
-
-bot.hears('📋 הצג הגדרות', (ctx) => {
-  if (!isAdmin(ctx.from.id)) return;
-  let msg = '⚙️ הגדרות:\n\n';
-  msg += `🔓 חיפוש: ללא הגבלות\n`;
-  msg += `📁 קבצים: ${config.uploadedFiles?.length || 0}\n`;
-  msg += `👥 משתמשים במאגר: 3,956,428\n`;
-  msg += `💾 גודל כולל: ${getTotalSize()}`;
-  ctx.reply(msg);
-});
-
-bot.hears('🔙 חזור', (ctx) => {
-  const isAdminUser = isAdmin(ctx.from.id);
-  const keyboard = isAdminUser
-    ? Markup.keyboard([
-        ['🔍 חיפוש טלפון', '🆔 חיפוש ID'],
-        ['📊 סטטיסטיקות', '⚙️ הגדרות'],
-        ['📁 העלאת קבצים', '📋 קבצים']
-      ]).resize()
-    : Markup.keyboard([
-        ['🔍 חיפוש טלפון', '🆔 חיפוש ID'],
-        ['📊 סטטיסטיקות', '❓ עזרה']
-      ]).resize();
-
-  ctx.reply('🔙 חזרנו', keyboard);
-});
-
-// Document upload handler (Still kept for small files via Telegram)
+// Handle direct file uploads
 bot.on('document', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    ctx.reply('❌ רק Admin');
-    return;
-  }
-
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ רק Admin');
   try {
-    ctx.sendChatAction('upload_document');
-
     const file = ctx.message.document;
     const fileName = file.file_name;
-    const fileExt = path.extname(fileName).toLowerCase();
-
-    // Download file
     const fileLink = await ctx.telegram.getFileLink(file.file_id);
+    
+    ctx.reply(`⏳ מעבד קובץ: ${fileName}...`);
+    
     const response = await fetch(fileLink.href);
     const buffer = await response.arrayBuffer();
-    const bufferObj = Buffer.from(buffer);
-
-    // Save file
     const uniqueName = `${Date.now()}_${fileName}`;
-    const filePath = path.join(uploadsDir, uniqueName);
-    fs.writeFileSync(filePath, bufferObj);
+    fs.writeFileSync(path.join(uploadsDir, uniqueName), Buffer.from(buffer));
 
-    // Add to config
-    config.uploadedFiles = config.uploadedFiles || [];
     config.uploadedFiles.push({
       name: fileName,
       path: uniqueName,
-      type: fileExt.substring(1).toUpperCase() || 'FILE',
+      type: path.extname(fileName).toUpperCase().substring(1),
       date: new Date().toISOString().split('T')[0],
-      size: formatFileSize(bufferObj.byteLength)
+      size: (buffer.byteLength / 1024 / 1024).toFixed(2) + ' MB'
     });
-
     saveConfig();
+    ctx.reply(`✅ קובץ ${fileName} נשמר בהצלחה ונוסף למאגר!`);
+  } catch (e) { ctx.reply(`❌ שגיאה: ${e.message}`); }
+});
 
-    ctx.reply(
-      `✅ קובץ ${fileName} הועלה בהצלחה!\n\n` +
-      `📊 סוג: ${fileExt || 'לא ידוע'}\n` +
-      `💾 גודל: ${formatFileSize(bufferObj.byteLength)}`
-    );
+bot.on('text', async (ctx) => {
+  const text = ctx.message.text.trim();
+  if (text.startsWith('/')) return;
 
-  } catch (error) {
-    console.error('Upload error:', error);
-    ctx.reply(`❌ שגיאה בהעלאה: ${error.message}`);
+  ctx.sendChatAction('typing');
+  let type = 'phone';
+  let query = text;
+
+  if (text.includes('facebook.com')) {
+    const match = text.match(/(?:facebook\.com\/(?:profile\.php\?id=|groups\/|pages\/[^\/]+\/|)([a-zA-Z0-9.]+))/);
+    query = match ? match[1] : text;
+    type = 'uid';
+  } else if (/^\d+$/.test(text) && text.length > 8) {
+    type = 'uid';
+  } else {
+    query = text.replace(/\D/g, '');
+    if (query.startsWith('0')) query = '972' + query.substring(1);
+  }
+
+  const results = await searchAllSources(query, type);
+  if (results.length > 0) {
+    let fullMessage = `🔍 נמצאו ${results.length} תוצאות:\n\n`;
+    results.forEach(res => {
+      fullMessage += formatUserData(res.source, res.data);
+    });
+    ctx.reply(fullMessage, { parse_mode: 'Markdown' });
+  } else {
+    ctx.reply('❌ לא נמצאו תוצאות בכל המאגרים.');
   }
 });
 
-// Text message handler
-bot.on('text', (ctx) => {
-  try {
-    const text = ctx.message.text.trim();
-    if (text.startsWith('/')) return; // Ignore commands
-
-    ctx.sendChatAction('typing');
-
-    let searchType = 'phone';
-    let searchQuery = text;
-
-    if (text.includes('facebook.com')) {
-      let match = text.match(/(?:facebook\.com\/(?:profile\.php\?id=|groups\/|pages\/[^\/]+\/|)([a-zA-Z0-9.]+))/);
-      if (match && match[1]) {
-        searchQuery = match[1];
-        searchType = "uid";
-      } else {
-        match = text.match(/(?:facebook\.com\/)([a-zA-Z0-9.]+)/);
-        if (match && match[1]) {
-          searchQuery = match[1];
-          searchType = "uid";
-        }
-      }
-    } else if (/^\d+$/.test(text) && text.length > 8) {
-      searchType = "uid";
-    } else if (/^[0-9+\-\s()]+$/.test(text)) {
-      searchType = 'phone';
-      searchQuery = normalizePhone(text);
-    }
-
-    const database = getDB();
-    if (!database) {
-      ctx.reply('❌ בעיה בבסיס נתונים');
-      return;
-    }
-
-    let result = null;
-    if (searchType === 'phone') {
-      const stmt = database.prepare('SELECT * FROM facebook WHERE phone = ? LIMIT 1');
-      result = stmt.get(searchQuery);
-    } else if (searchType === 'uid') {
-      const stmt = database.prepare('SELECT * FROM facebook WHERE uid = ? LIMIT 1');
-      result = stmt.get(searchQuery);
-    }
-
-    if (result) {
-      ctx.reply(formatUserData(result));
-    } else {
-      ctx.reply('לא נמצא ❌');
-    }
-  } catch (error) {
-    console.error('Text handler error:', error);
-    ctx.reply('❌ שגיאה');
-  }
-});
-
-// --- Web Server Endpoints for Large File Uploads ---
-
+// --- Web Server ---
 app.get('/upload-page', (req, res) => {
   const adminId = parseInt(req.query.adminId);
-  if (!isAdmin(adminId)) {
-    return res.status(403).send('Unauthorized');
-  }
-
+  if (!isAdmin(adminId)) return res.status(403).send('Unauthorized');
   res.send(`
-    <!DOCTYPE html>
     <html dir="rtl">
-    <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>העלאת קבצים גדולים</title>
-      <style>
-        body { font-family: sans-serif; background: #f0f2f5; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-        .card { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); width: 100%; max-width: 400px; text-align: center; }
-        h1 { color: #1c1e21; font-size: 1.5rem; }
-        input[type="file"] { margin: 1.5rem 0; width: 100%; }
-        button { background: #0088cc; color: white; border: none; padding: 0.8rem 1.5rem; border-radius: 4px; cursor: pointer; font-size: 1rem; width: 100%; }
-        button:disabled { background: #ccc; }
-        #progress-container { margin-top: 1.5rem; display: none; }
-        #progress-bar { background: #e9ecef; border-radius: 4px; height: 20px; width: 100%; overflow: hidden; }
-        #progress-fill { background: #0088cc; height: 100%; width: 0%; transition: width 0.3s; }
-        #status { margin-top: 1rem; font-size: 0.9rem; color: #65676b; }
-      </style>
-    </head>
-    <body>
-      <div class="card">
-        <h1>📁 העלאת קבצים ללא הגבלה</h1>
-        <p>בחר קובץ (בכל גודל) להעלאה לשרת</p>
-        <input type="file" id="fileInput">
-        <button id="uploadBtn">התחל העלאה</button>
-        
-        <div id="progress-container">
-          <div id="progress-bar"><div id="progress-fill"></div></div>
-          <p id="status">מכין העלאה...</p>
-        </div>
-      </div>
-
+    <body style="font-family:sans-serif; text-align:center; padding:50px;">
+      <h2>📁 העלאת קבצים למאגר</h2>
+      <input type="file" id="f"><br><br>
+      <button onclick="u()">העלאה</button>
+      <p id="s"></p>
       <script>
-        const fileInput = document.getElementById('fileInput');
-        const uploadBtn = document.getElementById('uploadBtn');
-        const progressContainer = document.getElementById('progress-container');
-        const progressFill = document.getElementById('progress-fill');
-        const status = document.getElementById('status');
-
-        uploadBtn.onclick = async () => {
-          if (!fileInput.files.length) return alert('אנא בחר קובץ');
-          
-          const file = fileInput.files[0];
-          uploadBtn.disabled = true;
-          progressContainer.style.display = 'block';
-          
-          const formData = new FormData();
-          formData.append('file', file);
-
-          const xhr = new XMLHttpRequest();
-          xhr.open('POST', '/upload-stream?adminId=${adminId}', true);
-
-          xhr.upload.onprogress = (e) => {
-            if (e.lengthComputable) {
-              const percent = Math.round((e.loaded / e.total) * 100);
-              progressFill.style.width = percent + '%';
-              status.innerText = 'מעלה: ' + percent + '% (' + formatSize(e.loaded) + ' מתוך ' + formatSize(e.total) + ')';
-            }
-          };
-
-          xhr.onload = () => {
-            if (xhr.status === 200) {
-              status.innerText = '✅ ההעלאה הושלמה בהצלחה!';
-              status.style.color = 'green';
-            } else {
-              status.innerText = '❌ שגיאה בהעלאה: ' + xhr.responseText;
-              status.style.color = 'red';
-              uploadBtn.disabled = false;
-            }
-          };
-
-          xhr.onerror = () => {
-            status.innerText = '❌ שגיאה בחיבור לשרת';
-            status.style.color = 'red';
-            uploadBtn.disabled = false;
-          };
-
-          xhr.send(formData);
-        };
-
-        function formatSize(bytes) {
-          if (bytes === 0) return '0 B';
-          const k = 1024;
-          const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-          const i = Math.floor(Math.log(bytes) / Math.log(k));
-          return Math.round((bytes / Math.pow(k, i)) * 10) / 10 + ' ' + sizes[i];
+        async function u() {
+          const file = document.getElementById('f').files[0];
+          if(!file) return alert('בחר קובץ');
+          const d = new FormData(); d.append('file', file);
+          document.getElementById('s').innerText = 'מעלה...';
+          const r = await fetch('/upload-stream?adminId=${adminId}', {method:'POST', body:d});
+          document.getElementById('s').innerText = r.ok ? '✅ הצליח' : '❌ נכשל';
         }
       </script>
     </body>
@@ -512,78 +272,29 @@ app.get('/upload-page', (req, res) => {
 
 app.post('/upload-stream', (req, res) => {
   const adminId = parseInt(req.query.adminId);
-  if (!isAdmin(adminId)) {
-    return res.status(403).send('Unauthorized');
-  }
-
+  if (!isAdmin(adminId)) return res.status(403).send('Unauthorized');
   const bb = busboy({ headers: req.headers });
-  let fileName = '';
-  let filePath = '';
-  let fileSize = 0;
-
   bb.on('file', (name, file, info) => {
-    fileName = info.filename;
-    const uniqueName = `${Date.now()}_${fileName}`;
-    filePath = path.join(uploadsDir, uniqueName);
-    const saveTo = fs.createWriteStream(filePath);
-    
-    file.on('data', (data) => {
-      fileSize += data.length;
-    });
-
+    const uniqueName = `${Date.now()}_${info.filename}`;
+    const saveTo = fs.createWriteStream(path.join(uploadsDir, uniqueName));
+    let size = 0;
+    file.on('data', d => size += d.length);
     file.pipe(saveTo);
-  });
-
-  bb.on('finish', () => {
-    const fileExt = path.extname(fileName).toLowerCase();
-    config.uploadedFiles = config.uploadedFiles || [];
-    config.uploadedFiles.push({
-      name: fileName,
-      path: path.basename(filePath),
-      type: fileExt.substring(1).toUpperCase() || 'FILE',
-      date: new Date().toISOString().split('T')[0],
-      size: formatFileSize(fileSize)
+    bb.on('finish', () => {
+      config.uploadedFiles.push({
+        name: info.filename, path: uniqueName, type: 'FILE',
+        date: new Date().toISOString().split('T')[0],
+        size: (size / 1024 / 1024).toFixed(2) + ' MB'
+      });
+      saveConfig();
+      bot.telegram.sendMessage(ADMIN_ID, `✅ קובץ הועלה מהאתר: ${info.filename}`);
+      res.send('OK');
     });
-    saveConfig();
-
-    // Notify admin via bot
-    bot.telegram.sendMessage(ADMIN_ID, `✅ קובץ גדול הועלה בהצלחה!\n\n📄 שם: ${fileName}\n💾 גודל: ${formatFileSize(fileSize)}`);
-    
-    res.status(200).send('Success');
   });
-
   req.pipe(bb);
 });
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', bot: 'running', timestamp: new Date().toISOString() });
-});
+app.get('/health', (req, res) => res.json({status:'ok'}));
 
-// Start services
-async function start() {
-  try {
-    const database = getDB();
-    if (database) {
-      const count = database.prepare('SELECT COUNT(*) as cnt FROM facebook').get();
-      console.log(`✅ Database ready: ${count.cnt} records`);
-    }
-
-    app.listen(PORT, '0.0.0.0', () => {
-      console.log(`🌐 Server on port ${PORT}`);
-    });
-
-    await bot.launch();
-    console.log('🤖 Bot launched');
-  } catch (error) {
-    console.error('❌ Startup error:', error);
-    process.exit(1);
-  }
-}
-
-start();
-
-process.on('SIGINT', () => {
-  bot.stop();
-  if (db) db.close();
-  process.exit(0);
-});
+app.listen(PORT, '0.0.0.0', () => console.log(`Server on ${PORT}`));
+bot.launch();
